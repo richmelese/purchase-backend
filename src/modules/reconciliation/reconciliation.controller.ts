@@ -14,6 +14,7 @@ import {
 import type { Request, Response } from 'express';
 import { ReconciliationService } from './reconciliation.service.js';
 import { Permission } from '../../common/decorators/permission.decorator.js';
+import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 
 async function extractBuffer(req: Request): Promise<Buffer> {
   if (Buffer.isBuffer(req.body) && req.body.length > 0) {
@@ -73,18 +74,18 @@ export class ReconciliationController {
     return this.recService.listBankTransactions({
       bank_account_id: bankAccountId ? +bankAccountId : null,
       search: search || '',
-      limit: limit ? +limit : 200,
+      limit: limit ? +limit : 0,
       offset: offset ? +offset : 0,
     });
   }
 
-  @Permission(['reconciliation', 'create'])
+  @Permission(['reconciliation', 'create', 'create_bank_tx'])
   @Get('transactions/next-code/:bankAccountId')
   async nextBankCode(@Param('bankAccountId') bankAccountId: string) {
     return this.recService.nextBankCode(+bankAccountId);
   }
 
-  @Permission(['reconciliation', 'create'])
+  @Permission(['reconciliation', 'create', 'create_bank_tx'])
   @Post('transactions')
   async createTransaction(@Body() body: any) {
     return this.recService.saveBankTransaction(body);
@@ -104,34 +105,31 @@ export class ReconciliationController {
 
   @Permission(['reconciliation', 'view'])
   @Get('purchases')
-  async getPurchasesReconciliation(@Query('status') status?: string, @Query('search') search?: string) {
-    return this.recService.getPurchasesReconciliation({ status, search });
+  async getPurchasesReconciliation(@CurrentUser() user: any, @Query('status') status?: string, @Query('search') search?: string) {
+    return this.recService.getPurchasesReconciliation({ status, search }, user);
   }
 
   @Permission(['reconciliation', 'view'])
   @Get('sales')
-  async getSalesReconciliation(@Query('status') status?: string, @Query('search') search?: string) {
-    return this.recService.getSalesReconciliation({ status, search });
+  async getSalesReconciliation(@CurrentUser() user: any, @Query('status') status?: string, @Query('search') search?: string) {
+    return this.recService.getSalesReconciliation({ status, search }, user);
   }
 
   @Permission(['reconciliation', 'view'])
   @Get('summary')
-  async getSummary() {
-    return this.recService.getReconciliationSummary();
+  async getSummary(@CurrentUser() user: any) {
+    return this.recService.getReconciliationSummary(user);
   }
 
-  @Permission(['reconciliation', 'edit'])
+  @Permission(['reconciliation', 'edit', 'run_automatch'])
   @Post('auto-match')
   async autoMatch() {
     return this.recService.autoMatchTransactions();
   }
 
-  @Permission(['reconciliation', 'create'])
+  @Permission(['reconciliation', 'create', 'import_bank'])
   @Post('import')
   async importWorkbook(@Req() req: Request) {
-    if ((req.body as any)?.filePath) {
-      return this.recService.importReconciliationWorkbook((req.body as any).filePath);
-    }
     const buf = await extractBuffer(req);
     if (!buf || buf.length === 0) {
       throw new BadRequestException('Choose an .xlsx file to import');
@@ -141,8 +139,8 @@ export class ReconciliationController {
 
   @Permission(['reconciliation', 'export'])
   @Get('export')
-  async exportWorkbook(@Res() res: Response) {
-    const buffer = await this.recService.exportReconciliationWorkbook();
+  async exportWorkbook(@Res() res: Response, @CurrentUser() user: any) {
+    const buffer = await this.recService.exportReconciliationWorkbook(user);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="EC_Bank_Reconciliation_Form.xlsx"');
     res.send(buffer);

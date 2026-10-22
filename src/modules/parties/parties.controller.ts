@@ -8,7 +8,8 @@ import { Permission } from '../../common/decorators/permission.decorator.js';
 export class PartiesController {
   constructor(private readonly partiesService: PartiesService) {}
 
-  @Permission(['parties', 'view'], ['purchases', 'view'], ['purchases', 'create'], ['purchases', 'edit'], ['sales', 'view'], ['sales', 'create'], ['sales', 'edit'])
+  // Also open to user managers: the user form's company-access picker lists the companies.
+  @Permission(['parties', 'view'], ['purchases', 'view'], ['purchases', 'create'], ['purchases', 'edit'], ['sales', 'view'], ['sales', 'create'], ['sales', 'edit'], ['users', 'create'], ['users', 'edit'])
   @Get()
   async listParties(@Query('type') type?: string, @Query('q') q?: string, @CurrentUser() user?: any) {
     return this.partiesService.listParties(type, q, user);

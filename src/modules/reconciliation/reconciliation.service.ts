@@ -20,6 +20,19 @@ export function normalizeCode(code: any): string {
   return s;
 }
 
+/** Value dates are stored as YYYY-MM-DD (what the UI formats); d/m/yyyy text and Excel dates are converted. */
+export function isoDate(v: any): string | null {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v.toISOString().slice(0, 10);
+  if (typeof v === 'number') return isoDate(new Date(Math.round((v - 25569) * 86400000))); // Excel serial
+  const s = String(v).trim();
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${iso[2].padStart(2, '0')}-${iso[3].padStart(2, '0')}`;
+  const dmy = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  return s;
+}
+
 export function codesMatch(a: any, b: any): boolean {
   if (!a || !b) return false;
   return normalizeCode(a) === normalizeCode(b);
@@ -70,15 +83,35 @@ export class ReconciliationService {
     return acc;
   }
 
+  /** Throws one 400 with every problem keyed by the form field it belongs to. */
+  private static fail(fields: Record<string, string>) {
+    if (Object.keys(fields).length) {
+      throw new BadRequestException({ message: 'Please correct the highlighted fields', fields });
+    }
+  }
+
+  /** A blank amount counts as 0; anything else must be a number (optionally ≥ min). */
+  private static checkAmount(fields: Record<string, string>, key: string, value: any, { min }: { min?: number } = {}) {
+    if (value === undefined || value === null || String(value).trim() === '') return;
+    const n = Number(value);
+    if (!Number.isFinite(n)) fields[key] = 'Enter a number';
+    else if (min !== undefined && n < min) fields[key] = `Must be ${min} or more`;
+  }
+
   public async saveBankAccount(input: any) {
+    const fields: Record<string, string> = {};
     const accountNo = Number(input.account_no);
-    if (!accountNo || accountNo < 1) throw new BadRequestException('Valid account number is required');
+    if (!Number.isInteger(accountNo) || accountNo < 1) fields.account_no = 'Enter a tab number (1 or more)';
     const bankName = String(input.bank_name || '').trim();
-    if (!bankName) throw new BadRequestException('Bank name is required');
+    if (!bankName) fields.bank_name = 'Choose a bank';
+    ReconciliationService.checkAmount(fields, 'opening_balance', input.opening_balance);
+    ReconciliationService.fail(fields);
     const accountName = String(input.account_name || `Bank ${String(accountNo).padStart(2, '0')}`).trim();
 
     const existing = await this.accountRepo.findOne({ where: { account_no: accountNo } });
-    if (existing) throw new ConflictException(`Account number ${accountNo} already exists`);
+    if (existing) {
+      throw new ConflictException({ message: `Account number ${accountNo} already exists`, fields: { account_no: 'Already used' } });
+    }
 
     const result = await this.accountRepo.insert({
       account_no: accountNo,
@@ -95,6 +128,10 @@ export class ReconciliationService {
 
   public async updateBankAccount(id: number, input: any) {
     const acc = await this.getBankAccount(id);
+    const fields: Record<string, string> = {};
+    if (input.bank_name !== undefined && !String(input.bank_name ?? '').trim()) fields.bank_name = 'Choose a bank';
+    ReconciliationService.checkAmount(fields, 'opening_balance', input.opening_balance);
+    ReconciliationService.fail(fields);
     await this.accountRepo.update(id, {
       bank_name: input.bank_name !== undefined ? String(input.bank_name).trim() : acc.bank_name,
       account_name: input.account_name !== undefined ? String(input.account_name).trim() : acc.account_name,
@@ -120,21 +157,17 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
-  public getInvoiceExpected(invoiceNo: string, kind: 'P' | 'S' | null = null): number {
-    if (!invoiceNo) return 0;
-    const ds = this.accountRepo.getDataSource();
-    const norm = normalizeCode(invoiceNo);
-    let inv = ds.queryOne('SELECT * FROM invoices WHERE invoice_no = ?', [norm]);
-    if (!inv) inv = ds.queryOne('SELECT * FROM invoices WHERE invoice_no = ?', [invoiceNo]);
-    if (!inv) return 0;
-    if (kind && inv.kind !== kind) return 0;
+  /**
+   * Amount expected at the bank per invoice code: the grand total less the withholding due, i.e. the
+   * same `amount_due` the invoice screens show.
+   */
+  private async expectedByCode(kind: 'P' | 'S', user?: any): Promise<Map<string, number>> {
+    const invoices = await this.invoicesService.listInvoices({ kind }, user);
+    return new Map(invoices.map((inv: any) => [normalizeCode(inv.invoice_no), round2(inv.amount_due || 0)]));
+  }
 
-    if (inv.kind === 'P') {
-      const wh = Number(inv.wh_paid || inv.wh_amount || 0);
-      return round2((inv.grand_total || 0) - wh);
-    }
-    const wh = Number(inv.wh_amount || 0);
-    return round2((inv.grand_total || 0) - wh);
+  private static expectedFor(map: Map<string, number>, code: any): number {
+    return code ? map.get(normalizeCode(code)) || 0 : 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -149,7 +182,7 @@ export class ReconciliationService {
     return { next_row_no: nextRow, next_bank_code: code, bank_name: acc.bank_name };
   }
 
-  public async listBankTransactions({ bank_account_id, search, limit = 200, offset = 0 }: any = {}) {
+  public async listBankTransactions({ bank_account_id, search, limit = 0, offset = 0 }: any = {}) {
     const ds = this.accountRepo.getDataSource();
     let sql = `
       SELECT t.*, a.bank_name, a.account_name, a.account_no
@@ -177,16 +210,15 @@ export class ReconciliationService {
     }
 
     const rows = ds.query(sql, params);
+    const pMap = await this.expectedByCode('P');
+    const sMap = await this.expectedByCode('S');
+    const exp = ReconciliationService.expectedFor;
 
     return rows.map((r: any) => {
-      const p1Exp = this.getInvoiceExpected(r.purchase_code_1, 'P');
-      const p2Exp = this.getInvoiceExpected(r.purchase_code_2, 'P');
-      const pExpected = round2(p1Exp + p2Exp);
+      const pExpected = round2(exp(pMap, r.purchase_code_1) + exp(pMap, r.purchase_code_2));
       const pDiff = round2((r.debit || 0) - pExpected);
 
-      const s1Exp = this.getInvoiceExpected(r.sales_code_1, 'S');
-      const s2Exp = this.getInvoiceExpected(r.sales_code_2, 'S');
-      const sExpected = round2(s1Exp + s2Exp);
+      const sExpected = round2(exp(sMap, r.sales_code_1) + exp(sMap, r.sales_code_2));
       const sDiff = round2((r.credit || 0) - sExpected);
 
       return {
@@ -201,9 +233,26 @@ export class ReconciliationService {
     });
   }
 
+  /** Field checks shared by create and update (update only checks what it was sent). */
+  private validateTransaction(input: any, creating: boolean) {
+    const fields: Record<string, string> = {};
+    if (creating || input.bank_account_id !== undefined) {
+      const id = Number(input.bank_account_id);
+      const exists = id && this.accountRepo.getDataSource().queryOne('SELECT 1 FROM bank_accounts WHERE id = ?', [id]);
+      if (!exists) fields.bank_account_id = 'Choose a bank account';
+    }
+    if (input.value_date) {
+      const d = isoDate(input.value_date);
+      if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d) || Number.isNaN(Date.parse(d))) fields.value_date = 'Enter a valid date';
+    }
+    ReconciliationService.checkAmount(fields, 'debit', input.debit, { min: 0 });
+    ReconciliationService.checkAmount(fields, 'credit', input.credit, { min: 0 });
+    ReconciliationService.fail(fields);
+  }
+
   public async saveBankTransaction(input: any) {
+    this.validateTransaction(input, true);
     const bankAccountId = Number(input.bank_account_id);
-    if (!bankAccountId) throw new BadRequestException('Bank account ID is required');
     const acc = await this.getBankAccount(bankAccountId);
 
     let rowNo = Number(input.row_no);
@@ -221,7 +270,7 @@ export class ReconciliationService {
       bank_account_id: bankAccountId,
       row_no: rowNo,
       bank_code: bankCode,
-      value_date: input.value_date ? String(input.value_date).trim() : null,
+      value_date: isoDate(input.value_date),
       purchase_code_1: input.purchase_code_1 ? normalizeCode(input.purchase_code_1) : null,
       purchase_code_2: input.purchase_code_2 ? normalizeCode(input.purchase_code_2) : null,
       debit: Number(input.debit || 0),
@@ -238,12 +287,22 @@ export class ReconciliationService {
   public async updateBankTransaction(id: number, input: any) {
     const tx = await this.txRepo.findOne({ where: { id } });
     if (!tx) throw new NotFoundException('Transaction not found');
+    this.validateTransaction(input, false);
+
+    const bankAccountId = input.bank_account_id !== undefined ? Number(input.bank_account_id) : tx.bank_account_id;
+    const rowNo = input.row_no !== undefined && Number(input.row_no) >= 1 ? Number(input.row_no) : tx.row_no;
+    let bankCode = input.bank_code !== undefined ? String(input.bank_code ?? '').trim() : tx.bank_code;
+    if (!bankCode) {
+      // Same rule as on create: a blank code is generated from the bank name and row number.
+      const acc = await this.getBankAccount(bankAccountId);
+      bankCode = `${acc.bank_name}${String(rowNo).padStart(3, '0')}`;
+    }
 
     await this.txRepo.update(id, {
-      bank_account_id: input.bank_account_id !== undefined ? Number(input.bank_account_id) : tx.bank_account_id,
-      row_no: input.row_no !== undefined ? Number(input.row_no) : tx.row_no,
-      bank_code: input.bank_code !== undefined ? String(input.bank_code).trim() : tx.bank_code,
-      value_date: input.value_date !== undefined ? (input.value_date ? String(input.value_date).trim() : null) : tx.value_date,
+      bank_account_id: bankAccountId,
+      row_no: rowNo,
+      bank_code: bankCode,
+      value_date: input.value_date !== undefined ? isoDate(input.value_date) : tx.value_date,
       purchase_code_1: input.purchase_code_1 !== undefined ? (input.purchase_code_1 ? normalizeCode(input.purchase_code_1) : null) : tx.purchase_code_1,
       purchase_code_2: input.purchase_code_2 !== undefined ? (input.purchase_code_2 ? normalizeCode(input.purchase_code_2) : null) : tx.purchase_code_2,
       debit: input.debit !== undefined ? Number(input.debit || 0) : tx.debit,
@@ -267,8 +326,8 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Purchases Reconciliation View
   // ---------------------------------------------------------------------------
-  public async getPurchasesReconciliation({ status = 'all', search = '' }: any = {}) {
-    const purchases = await this.invoicesService.listInvoices({ kind: 'P' });
+  public async getPurchasesReconciliation({ status = 'all', search = '' }: any = {}, user?: any) {
+    const purchases = await this.invoicesService.listInvoices({ kind: 'P' }, user);
     const ds = this.accountRepo.getDataSource();
     const allTx = ds.query(`
       SELECT t.*, a.bank_name, a.account_name, a.account_no
@@ -281,15 +340,16 @@ export class ReconciliationService {
       const norm = normalizeCode(p.invoice_no);
       const matched = allTx.filter((t: any) => codesMatch(t.purchase_code_1, norm) || codesMatch(t.purchase_code_2, norm));
 
-      const wh = Number(p.wh_paid || p.wh_amount || 0);
-      const expected = round2((p.grand_total || 0) - wh);
+      const wh = round2(p.wh?.expected || 0);
+      const expected = round2(p.amount_due || 0);
       const bankAmt = round2(matched.reduce((acc: number, t: any) => acc + (t.debit || 0), 0));
-      const diff = round2(expected - bankAmt);
+      // Same sign as the bank statement rows: bank − expected (negative = still short).
+      const diff = round2(bankAmt - expected);
 
       let recStatus = 'Unreconciled';
       if (bankAmt > 0 && Math.abs(diff) < 0.01) recStatus = 'Reconciled';
-      else if (bankAmt > 0 && diff > 0) recStatus = 'Partial';
-      else if (diff < -0.01) recStatus = 'Overpaid';
+      else if (bankAmt > 0 && diff < 0) recStatus = 'Partial';
+      else if (diff > 0.01) recStatus = 'Overpaid';
 
       const bankCodes = matched.map((t: any) => t.bank_code);
       const bankNames = [...new Set(matched.map((t: any) => t.bank_name))];
@@ -338,8 +398,8 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Sales Reconciliation View
   // ---------------------------------------------------------------------------
-  public async getSalesReconciliation({ status = 'all', search = '' }: any = {}) {
-    const sales = await this.invoicesService.listInvoices({ kind: 'S' });
+  public async getSalesReconciliation({ status = 'all', search = '' }: any = {}, user?: any) {
+    const sales = await this.invoicesService.listInvoices({ kind: 'S' }, user);
     const ds = this.accountRepo.getDataSource();
     const allTx = ds.query(`
       SELECT t.*, a.bank_name, a.account_name, a.account_no
@@ -352,15 +412,15 @@ export class ReconciliationService {
       const norm = normalizeCode(s.invoice_no);
       const matched = allTx.filter((t: any) => codesMatch(t.sales_code_1, norm) || codesMatch(t.sales_code_2, norm));
 
-      const wh = Number(s.wh_amount || 0);
-      const expected = round2((s.grand_total || 0) - wh);
+      const wh = round2(s.wh?.expected || 0);
+      const expected = round2(s.amount_due || 0);
       const bankAmt = round2(matched.reduce((acc: number, t: any) => acc + (t.credit || 0), 0));
-      const diff = round2(expected - bankAmt);
+      const diff = round2(bankAmt - expected);
 
       let recStatus = 'Unreconciled';
       if (bankAmt > 0 && Math.abs(diff) < 0.01) recStatus = 'Reconciled';
-      else if (bankAmt > 0 && diff > 0) recStatus = 'Partial';
-      else if (diff < -0.01) recStatus = 'Overcollected';
+      else if (bankAmt > 0 && diff < 0) recStatus = 'Partial';
+      else if (diff > 0.01) recStatus = 'Overcollected';
 
       const bankCodes = matched.map((t: any) => t.bank_code);
       const bankNames = [...new Set(matched.map((t: any) => t.bank_name))];
@@ -408,10 +468,10 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Summary
   // ---------------------------------------------------------------------------
-  public async getReconciliationSummary() {
+  public async getReconciliationSummary(user?: any) {
     const accounts = await this.listBankAccounts();
-    const purchasesRec = await this.getPurchasesReconciliation();
-    const salesRec = await this.getSalesReconciliation();
+    const purchasesRec = await this.getPurchasesReconciliation({}, user);
+    const salesRec = await this.getSalesReconciliation({}, user);
 
     const totalBankDebit = round2(accounts.reduce((acc: number, a: any) => acc + a.total_debit, 0));
     const expectedPurchases = round2(purchasesRec.reduce((acc: number, p: any) => acc + p.expected_payment, 0));
@@ -455,49 +515,43 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   public async autoMatchTransactions() {
     const ds = this.accountRepo.getDataSource();
+    // Expected amounts need the withholding rules (async), so work them out before the transaction.
+    const pMap = await this.expectedByCode('P');
+    const sMap = await this.expectedByCode('S');
+
     return ds.transaction(() => {
-      let matchedPurchases = 0;
-      let matchedSales = 0;
       const details: any[] = [];
 
-      const unlinkedDebits = ds.query(`
-        SELECT * FROM bank_transactions
-        WHERE debit > 0 AND (purchase_code_1 IS NULL OR purchase_code_1 = '')
-      `);
-
-      const purchases = ds.query("SELECT * FROM invoices WHERE kind = 'P'");
-
-      for (const tx of unlinkedDebits) {
-        const candidate = purchases.find((p: any) => {
-          const exp = round2((p.grand_total || 0) - Number(p.wh_paid || p.wh_amount || 0));
-          return Math.abs(exp - tx.debit) < 0.01;
-        });
-        if (candidate) {
-          ds.execute('UPDATE bank_transactions SET purchase_code_1 = ? WHERE id = ?', [candidate.invoice_no, tx.id]);
-          matchedPurchases++;
-          details.push({ type: 'Purchase', transaction_id: tx.id, bank_code: tx.bank_code, invoice_no: candidate.invoice_no, amount: tx.debit });
+      // Links each unlinked bank line to an invoice whose expected amount equals it exactly. An invoice
+      // already referenced by any bank line (or matched earlier in this run) is never used twice.
+      const match = (side: 'purchase' | 'sales', amountCol: 'debit' | 'credit', expected: Map<string, number>, type: string) => {
+        const used = new Set<string>();
+        for (const r of ds.query(`SELECT ${side}_code_1 AS c1, ${side}_code_2 AS c2 FROM bank_transactions`)) {
+          if (r.c1) used.add(normalizeCode(r.c1));
+          if (r.c2) used.add(normalizeCode(r.c2));
         }
-      }
-
-      const unlinkedCredits = ds.query(`
-        SELECT * FROM bank_transactions
-        WHERE credit > 0 AND (sales_code_1 IS NULL OR sales_code_1 = '')
-      `);
-
-      const sales = ds.query("SELECT * FROM invoices WHERE kind = 'S'");
-
-      for (const tx of unlinkedCredits) {
-        const candidate = sales.find((s: any) => {
-          const exp = round2((s.grand_total || 0) - Number(s.wh_amount || 0));
-          return Math.abs(exp - tx.credit) < 0.01;
-        });
-        if (candidate) {
-          ds.execute('UPDATE bank_transactions SET sales_code_1 = ? WHERE id = ?', [candidate.invoice_no, tx.id]);
-          matchedSales++;
-          details.push({ type: 'Sale', transaction_id: tx.id, bank_code: tx.bank_code, invoice_no: candidate.invoice_no, amount: tx.credit });
+        const unlinked = ds.query(`
+          SELECT * FROM bank_transactions
+          WHERE ${amountCol} > 0 AND (${side}_code_1 IS NULL OR ${side}_code_1 = '')
+          ORDER BY bank_account_id, row_no
+        `);
+        let count = 0;
+        for (const tx of unlinked) {
+          let code: string | undefined;
+          for (const [c, amount] of expected) {
+            if (!used.has(c) && Math.abs(amount - tx[amountCol]) < 0.01) { code = c; break; }
+          }
+          if (!code) continue;
+          used.add(code);
+          ds.execute(`UPDATE bank_transactions SET ${side}_code_1 = ?, updated_at = datetime('now') WHERE id = ?`, [code, tx.id]);
+          count++;
+          details.push({ type, transaction_id: tx.id, bank_code: tx.bank_code, invoice_no: code, amount: tx[amountCol] });
         }
-      }
+        return count;
+      };
 
+      const matchedPurchases = match('purchase', 'debit', pMap, 'Purchase');
+      const matchedSales = match('sales', 'credit', sMap, 'Sale');
       return { matched_purchases: matchedPurchases, matched_sales: matchedSales, total_matched: matchedPurchases + matchedSales, details };
     });
   }
@@ -505,14 +559,12 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Excel Import
   // ---------------------------------------------------------------------------
-  public async importReconciliationWorkbook(fileInput: any) {
+  public async importReconciliationWorkbook(file: Buffer) {
     const wb = new ExcelJS.Workbook();
-    if (typeof fileInput === 'string') {
-      await wb.xlsx.readFile(fileInput);
-    } else if (fileInput && typeof fileInput === 'object' && fileInput.filePath) {
-      await wb.xlsx.readFile(fileInput.filePath);
-    } else {
-      await wb.xlsx.load(fileInput);
+    try {
+      await wb.xlsx.load(file as any);
+    } catch {
+      throw new BadRequestException('This file could not be read. Choose an Excel workbook (.xlsx).');
     }
 
     const ds = this.accountRepo.getDataSource();
@@ -561,8 +613,7 @@ export class ReconciliationService {
           const s2 = getVal(11);
           const credit = Number(getVal(12) || 0);
           const sRemark = getVal(15);
-          let valDate: any = getVal(16);
-          if (valDate instanceof Date) valDate = valDate.toISOString().split('T')[0];
+          const valDate = isoDate(getVal(16));
 
           if (!bankCode && !p1 && !s1 && debit === 0 && credit === 0) return;
 
@@ -629,14 +680,14 @@ export class ReconciliationService {
   // ---------------------------------------------------------------------------
   // Excel Export
   // ---------------------------------------------------------------------------
-  public async exportReconciliationWorkbook() {
+  public async exportReconciliationWorkbook(user?: any) {
     const wb = new ExcelJS.Workbook();
     wb.creator = 'Purchase & Sales Management';
     wb.created = new Date();
 
     const accounts = await this.listBankAccounts();
-    const purchases = await this.getPurchasesReconciliation();
-    const sales = await this.getSalesReconciliation();
+    const purchases = await this.getPurchasesReconciliation({}, user);
+    const sales = await this.getSalesReconciliation({}, user);
     const ds = this.accountRepo.getDataSource();
 
     // 1. Menu Sheet
@@ -782,7 +833,7 @@ export class ReconciliationService {
       hRow.fill = HEADER_FILL;
 
       if ((acc as any).id) {
-        const txs = await this.listBankTransactions({ bank_account_id: (acc as any).id, limit: 1000 });
+        const txs = await this.listBankTransactions({ bank_account_id: (acc as any).id });
         txs.forEach((tx: any) => {
           const row = ws.addRow([
             tx.row_no,

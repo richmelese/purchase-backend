@@ -37,7 +37,7 @@ before(async () => {
     env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DATABASE_PATH: path.join(dir, 'psm.db'), BFF_SHARED_SECRET: SECRET, CORS_ORIGIN: '' },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) { // cold starts can take well over 10 s
     try { if ((await fetch(`${BASE}/health`)).ok) return; } catch {}
     await new Promise((r) => setTimeout(r, 100));
   }

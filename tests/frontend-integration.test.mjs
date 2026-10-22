@@ -67,7 +67,7 @@ before(async () => {
 
   // Wait for backend to be healthy
   let backendReady = false;
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) { // cold starts can take well over 10 s
     try {
       const res = await fetch(`${BACKEND_URL}/api/health`);
       if (res.ok) { backendReady = true; break; }
@@ -91,7 +91,7 @@ before(async () => {
 
   // Wait for frontend login page to be reachable
   let frontendReady = false;
-  for (let i = 0; i < 150; i++) {
+  for (let i = 0; i < 300; i++) {
     try {
       const res = await fetch(`${FRONTEND_URL}/login`);
       if (res.status === 200) { frontendReady = true; break; }

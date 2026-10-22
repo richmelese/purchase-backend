@@ -37,7 +37,12 @@ const apiCall = async (method, urlPath, body, { cookie = '', headers = {} } = {}
   return { status: res.status, data, headers: res.headers };
 };
 
-const loginAs = async (username, password) => {
+// Generated passwords must be replaced on first sign-in; remember the replacement so later
+// logins of the same user keep working.
+const rotatedPasswords = new Map();
+
+const loginAs = async (username, initialPassword, changePasswordIfRequired = true) => {
+  const password = rotatedPasswords.get(username) || initialPassword;
   const res = await apiCall('POST', '/auth/login', { username, password, remember: false });
   assert.ok(res.status === 200 || res.status === 201, `Login failed for ${username}: ${JSON.stringify(res.data)}`);
   const cookies = typeof res.headers.getSetCookie === 'function'
@@ -45,7 +50,20 @@ const loginAs = async (username, password) => {
     : [res.headers.get('set-cookie')].filter(Boolean);
   const cookiePart = cookies.find((c) => c && c.startsWith('psm_session='));
   assert.ok(cookiePart, 'psm_session cookie missing');
-  return cookiePart.split(';')[0];
+  const cookie = cookiePart.split(';')[0];
+
+  if (res.data?.user?.must_change_password && changePasswordIfRequired) {
+    const newPw = 'Active' + password;
+    const changed = await apiCall('POST', '/auth/password', {
+      current_password: password,
+      new_password: newPw,
+      confirm: newPw,
+    }, { cookie });
+    assert.ok(changed.status < 300, `Password change failed for ${username}: ${JSON.stringify(changed.data)}`);
+    rotatedPasswords.set(username, newPw);
+  }
+
+  return cookie;
 };
 
 let adminCookie;
@@ -68,7 +86,7 @@ before(async () => {
     stdio: ['ignore', 'ignore', 'inherit'],
   });
 
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) { // cold starts can take well over 10 s
     try {
       const res = await fetch(`${BASE}/health`);
       if (res.ok) break;
@@ -204,7 +222,7 @@ test('Sidebar navigation and page accessibility dynamically adapts to each role'
   assert.ok(!salesNav.includes('/vat'), 'Sales officer must NOT see VAT');
   assert.ok(!salesNav.includes('/settings?tab=roles'), 'Sales officer must NOT see Roles');
   assert.ok(!salesNav.includes('/settings?tab=users'), 'Sales officer must NOT see Users');
-  assert.ok(!salesNav.includes('/settings'), 'Sales officer must NOT see Settings');
+  assert.ok(salesNav.includes('/settings'), 'Sales officer sees Settings for export tab');
 
   // CanOpenPage check
   assert.equal(canOpenPage(salesMe, '/sales'), true);
@@ -334,16 +352,18 @@ test('Company-scoped access: user restricted to specific companies cannot transa
   const purchRole = roles.find((r) => r.name === 'purchase_officer');
 
   // Create a purchase officer restricted ONLY to Company 1 (Alpha Supplier PLC)
-  await apiCall('POST', '/users', {
+  const createRes = await apiCall('POST', '/users', {
     full_name: 'Restricted Buyer',
     username: 'restricted_purchaser',
     password: 'Password123!',
     role_id: purchRole.id,
     access_all_parties: false,
-    parties: [
-      { id: comp1Id, rights: { view: true, create: true, edit: true, delete: false, export: true } },
-    ],
+    party_ids: [comp1Id],
+    party_rights: {
+      [comp1Id]: { view: true, create: true, edit: true, delete: false, export: true },
+    },
   }, { cookie: adminCookie });
+  assert.equal(createRes.status, 201, JSON.stringify(createRes.data));
 
   const restrictedCookie = await loginAs('restricted_purchaser', 'Password123!');
   const me = (await apiCall('GET', '/auth/me', undefined, { cookie: restrictedCookie })).data;
@@ -377,7 +397,7 @@ test('Company-scoped access: user restricted to specific companies cannot transa
   }, { cookie: restrictedCookie });
 
   assert.equal(illegalPurchase.status, 400);
-  assert.match(illegalPurchase.data.message, /only.*record invoices for companies where your access allows it/);
+  assert.match(illegalPurchase.data.error, /only.*record invoices for companies where your access allows it/);
 
   // Recording purchase for Company 1 succeeds
   const legalPurchase = await apiCall('POST', '/purchases', {

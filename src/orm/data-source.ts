@@ -90,6 +90,30 @@ export class DataSource {
     }
   }
 
+  private txQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * `transaction` for callbacks that await (repository methods are async). Commits only after the
+   * callback settles and rolls back if it rejects. Calls are queued so they never overlap on the single
+   * connection. The callback must only await database work, never network or file I/O.
+   */
+  public transactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+    const run = async () => {
+      this.exec('BEGIN');
+      try {
+        const result = await fn();
+        this.exec('COMMIT');
+        return result;
+      } catch (e) {
+        this.exec('ROLLBACK');
+        throw e;
+      }
+    };
+    const next = this.txQueue.then(run, run);
+    this.txQueue = next.catch(() => undefined);
+    return next;
+  }
+
   private runInitialMigrations(): void {
     this.exec(`
       CREATE TABLE IF NOT EXISTS settings (
@@ -357,8 +381,10 @@ export class DataSource {
           [r.name, r.label, r.description, r.is_system, JSON.stringify(r.permissions)],
         );
       }
-      this.exec("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'admin') WHERE role = 'admin' AND role_id IS NULL");
-      this.exec("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'viewer') WHERE role != 'admin' AND role_id IS NULL");
     }
+    // Staff accounts without a role id (older sign-ups) get one so their permissions resolve: admins the
+    // admin role, everyone else viewer. Company portal accounts (party_id set) deliberately have no role.
+    this.exec(`UPDATE users SET role_id = (SELECT id FROM roles WHERE name = CASE WHEN users.role = 'admin' THEN 'admin' ELSE 'viewer' END)
+               WHERE role_id IS NULL AND party_id IS NULL`);
   }
 }

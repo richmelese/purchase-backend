@@ -1,21 +1,24 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 
-// Role permissions are { resource: { view, create, edit, delete, export } } (see roles-data.ts).
-// Administrators may do everything; everyone else needs the specific right.
+// Role permissions are { resource: { view, create, edit, delete, export, <task id>... } } (see roles-data.ts).
+// Administrators may do everything; everyone else needs the specific right. A grant may also name a
+// task (e.g. purchases/edit/record_payment_p): the right must be on and that task not switched off in the
+// role editor. Roles saved before tasks existed have no task keys, so their rights cover every task.
 export type Right = 'view' | 'create' | 'edit' | 'delete' | 'export';
-export type Grant = readonly [resource: string, right: Right];
+export type Grant = readonly [resource: string, right: Right, task?: string];
 
 export const isAdmin = (user: any) => user?.role === 'admin';
 
-export function can(user: any, resource: string, right: Right): boolean {
+export function can(user: any, resource: string, right: Right, task?: string): boolean {
   if (!user) return false;
   if (isAdmin(user)) return true;
-  return !!user.permissions?.[resource]?.[right];
+  const perms = user.permissions?.[resource];
+  return !!perms?.[right] && (!task || perms[task] !== false);
 }
 
 /** Throws unless the user holds at least one of the grants. */
 export function assertCan(user: any, ...grants: Grant[]) {
-  if (!grants.some(([resource, right]) => can(user, resource, right))) {
+  if (!grants.some(([resource, right, task]) => can(user, resource, right, task))) {
     throw new ForbiddenException({ message: 'Your role does not allow this action', code: 'NO_PERMISSION' });
   }
 }

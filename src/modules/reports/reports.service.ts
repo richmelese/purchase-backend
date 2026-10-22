@@ -8,6 +8,18 @@ import { WithholdingService } from '../withholding/withholding.service.js';
 import { CreditService } from '../credit/credit.service.js';
 import { FY_MONTHS, currentFiscalYear } from '../../common/lib/ethiopian.js';
 import { round2 } from '../../common/lib/calc.js';
+import { allowedParties } from '../../common/permissions.js';
+
+/**
+ * SQL condition limiting invoices to the companies the user may see (same rule as the invoice lists).
+ * Returns '' for users with access to every company.
+ */
+function partyScope(user: any, column = 'party_id'): { sql: string; params: number[] } {
+  const allowed = allowedParties(user);
+  if (allowed === null) return { sql: '', params: [] };
+  if (!allowed.length) return { sql: ' AND 0', params: [] };
+  return { sql: ` AND ${column} IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+}
 
 @Injectable()
 export class ReportsService {
@@ -21,12 +33,13 @@ export class ReportsService {
     private readonly creditService: CreditService,
   ) {}
 
-  public async dashboard(fy: number) {
+  public async dashboard(fy: number, user?: any) {
     fy = +fy;
+    const scope = partyScope(user);
     const monthly = this.dataSource.query<any>(
       `SELECT kind, fy_month, SUM(taxable_amount) AS amount, SUM(vat_amount) AS vat, COUNT(*) AS n
-       FROM invoices WHERE fy = ? GROUP BY kind, fy_month`,
-      [fy],
+       FROM invoices WHERE fy = ?${scope.sql} GROUP BY kind, fy_month`,
+      [fy, ...scope.params],
     );
     const series = { P: Array(12).fill(0), S: Array(12).fill(0) };
     const totals = { P: { amount: 0, vat: 0, n: 0 }, S: { amount: 0, vat: 0, n: 0 } };
@@ -42,28 +55,29 @@ export class ReportsService {
     const allStock = await this.productsService.stockReport();
     const stock = allStock.filter((s) => s.track_stock);
 
-    const payables = await this.creditService.creditReport({ kind: 'P' });
-    const receivables = await this.creditService.creditReport({ kind: 'S' });
-    const whAll = await this.withholdingService.withholdingReport({ kind: 'P', fy });
+    const payables = await this.creditService.creditReport({ kind: 'P' }, user);
+    const receivables = await this.creditService.creditReport({ kind: 'S' }, user);
+    const whAll = await this.withholdingService.withholdingReport({ kind: 'P', fy }, user);
     const whPending = whAll.filter((w: any) => w.wh.outstanding > 0.004);
 
     const unreported = this.dataSource.query<{ kind: string; n: number }>(
-      "SELECT kind, COUNT(*) AS n FROM invoices WHERE fy = ? AND report_status = 'Not Reported' GROUP BY kind",
-      [fy],
+      `SELECT kind, COUNT(*) AS n FROM invoices WHERE fy = ? AND report_status = 'Not Reported'${scope.sql} GROUP BY kind`,
+      [fy, ...scope.params],
     );
     const topSuppliers = this.dataSource.query(
       `SELECT COALESCE(party_name, 'Unregistered') AS name, SUM(taxable_amount) AS amount, COUNT(*) AS n
-       FROM invoices WHERE fy = ? AND kind = 'P' GROUP BY COALESCE(party_tin, party_name) ORDER BY amount DESC LIMIT 5`,
-      [fy],
+       FROM invoices WHERE fy = ? AND kind = 'P'${scope.sql} GROUP BY COALESCE(party_tin, party_name) ORDER BY amount DESC LIMIT 5`,
+      [fy, ...scope.params],
     );
     const topCustomers = this.dataSource.query(
       `SELECT COALESCE(party_name, 'Unregistered') AS name, SUM(taxable_amount) AS amount, COUNT(*) AS n
-       FROM invoices WHERE fy = ? AND kind = 'S' GROUP BY COALESCE(party_tin, party_name) ORDER BY amount DESC LIMIT 5`,
-      [fy],
+       FROM invoices WHERE fy = ? AND kind = 'S'${scope.sql} GROUP BY COALESCE(party_tin, party_name) ORDER BY amount DESC LIMIT 5`,
+      [fy, ...scope.params],
     );
     const recent = this.dataSource.query(
       `SELECT id, kind, invoice_no, date, party_name, grand_total, payment_type FROM invoices
-       ORDER BY created_at DESC, id DESC LIMIT 8`,
+       WHERE 1 = 1${scope.sql} ORDER BY created_at DESC, id DESC LIMIT 8`,
+      scope.params,
     );
 
     const rules = await this.settingsService.getRules();
@@ -105,7 +119,7 @@ export class ReportsService {
     };
   }
 
-  public async monthlySummary(fy: number) {
+  public async monthlySummary(fy: number, user?: any) {
     const rows = FY_MONTHS.map((month, idx) => ({
       idx,
       month,
@@ -121,7 +135,7 @@ export class ReportsService {
     }));
 
     for (const kind of ['S', 'P'] as const) {
-      const invoices = await this.invoicesService.listInvoices({ kind, fy });
+      const invoices = await this.invoicesService.listInvoices({ kind, fy }, user);
       for (const i of invoices) {
         const r = rows[i.fy_month];
         if (kind === 'S') {
@@ -162,7 +176,7 @@ export class ReportsService {
     return { fy: +fy, rows, total };
   }
 
-  public async salesByProduct(period: { fy?: number; month?: number | string } = {}) {
+  public async salesByProduct(period: { fy?: number; month?: number | string } = {}, user?: any) {
     const w: string[] = [];
     const p: any[] = [];
     if (period.fy) {
@@ -173,7 +187,9 @@ export class ReportsService {
       w.push('i.fy_month = ?');
       p.push(+period.month);
     }
-    const whereSql = w.length ? ` AND ${w.join(' AND ')}` : '';
+    const scope = partyScope(user, 'i.party_id');
+    const whereSql = (w.length ? ` AND ${w.join(' AND ')}` : '') + scope.sql;
+    p.push(...scope.params);
 
     const sql = `SELECT COALESCE(pr.code, l.product_code, '') AS code, COALESCE(pr.name_en, l.description) AS name, pr.id AS product_id,
         SUM(l.qty) AS qty, SUM(l.total) AS sales, SUM(l.vat_amount) AS vat, COUNT(DISTINCT i.id) AS invoices,
@@ -204,9 +220,9 @@ export class ReportsService {
     });
   }
 
-  public async partyTotals(kind: 'P' | 'S', period: any = {}) {
+  public async partyTotals(kind: 'P' | 'S', period: any = {}, user?: any) {
     if (!['P', 'S'].includes(kind)) throw new NotFoundException('Unknown resource');
-    const invoices = await this.invoicesService.listInvoices({ kind, ...period });
+    const invoices = await this.invoicesService.listInvoices({ kind, ...period }, user);
     const map = new Map<string, any>();
 
     for (const i of invoices) {

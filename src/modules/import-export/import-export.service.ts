@@ -121,6 +121,7 @@ export class ImportExportService {
     const byLabel = Object.fromEntries(Object.entries(labels).map(([v, l]) => [l.toLowerCase(), +v]));
     const get = (row: any, f: string) => (map[f] ? cellValue(row.getCell(map[f])) : null);
     const num = (v: any) => {
+      if (v == null || String(v).trim() === '') return null;
       const n = Number(v);
       return Number.isFinite(n) && n >= 0 ? n : null;
     };
@@ -146,13 +147,17 @@ export class ImportExportService {
         const code = String(get(row, 'code') ?? '').trim();
         const name_en = String(get(row, 'name_en') ?? '').trim();
         if (!code && !name_en) continue;
+        if (/^total$/i.test(code)) continue; // totals row of an exported list
         if (!code || !name_en) {
           errors.push(`Row ${r}: both code and English name are required`);
           skipped += 1;
           continue;
         }
+        // A column missing from the sheet (or a blank cell) is null, so an update keeps the stored value
+        // (COALESCE) and only new products get the defaults below.
         const rawTrack = get(row, 'track_stock');
-        const track = rawTrack != null ? (rawTrack === false || rawTrack === 0 || rawTrack === '0' ? 0 : 1) : 1;
+        const track = rawTrack == null || rawTrack === '' ? null
+          : rawTrack === false || rawTrack === 0 || /^(0|no|false|n)$/i.test(String(rawTrack).trim()) ? 0 : 1;
         const vals = [
           name_en,
           get(row, 'name_am') ? String(get(row, 'name_am')).trim() : null,
@@ -160,12 +165,12 @@ export class ImportExportService {
           get(row, 'brand') ? String(get(row, 'brand')).trim() : null,
           get(row, 'model') ? String(get(row, 'model')).trim() : null,
           get(row, 'serial_no') ? String(get(row, 'serial_no')).trim() : null,
-          unitOf(get(row, 'unit')) ?? 7,
+          unitOf(get(row, 'unit')),
           track,
-          num(get(row, 'min_stock')) ?? 0,
-          num(get(row, 'opening_stock')) ?? 0,
-          num(get(row, 'purchase_price')) ?? 0,
-          num(get(row, 'selling_price')) ?? 0,
+          num(get(row, 'min_stock')),
+          num(get(row, 'opening_stock')),
+          num(get(row, 'purchase_price')),
+          num(get(row, 'selling_price')),
         ];
         if (existing.has(code)) {
           this.dataSource.execute(
@@ -180,7 +185,8 @@ export class ImportExportService {
           this.dataSource.execute(
             `INSERT INTO products (code, name_en, name_am, category, brand, model, serial_no, unit, track_stock, min_stock, opening_stock, purchase_price, selling_price)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-            [code, ...vals],
+            // New products: unit 7, stock-tracked, zero quantities and prices unless the sheet says otherwise.
+            [code, ...vals.slice(0, 6), vals[6] ?? 7, vals[7] ?? 1, ...vals.slice(8).map((v) => v ?? 0)],
           );
           existing.add(code);
           added += 1;
@@ -230,7 +236,9 @@ export class ImportExportService {
         if (!name) continue;
         const tin = cleanTin(get(row, 'tin'));
         const typeRaw = String(get(row, 'type') ?? '').toLowerCase();
-        const type = typeRaw.includes('cust') ? 'Customer' : typeRaw.includes('both') ? 'Both' : defaultType;
+        // The sheet's own type, if it has one. Without it an existing company keeps its type and only a new
+        // one gets the type of the list being imported.
+        const sheetType = typeRaw.includes('cust') ? 'Customer' : typeRaw.includes('both') ? 'Both' : typeRaw.includes('supp') ? 'Supplier' : null;
         const mrc1 = get(row, 'mrc1') ? String(get(row, 'mrc1')).trim() : null;
         const mrc2 = get(row, 'mrc2') ? String(get(row, 'mrc2')).trim() : null;
         const mrc3 = get(row, 'mrc3') ? String(get(row, 'mrc3')).trim() : null;
@@ -244,14 +252,14 @@ export class ImportExportService {
             `UPDATE parties SET name=COALESCE(?,name), type=COALESCE(?,type), mrc1=COALESCE(?,mrc1),
              mrc2=COALESCE(?,mrc2), mrc3=COALESCE(?,mrc3), phone=COALESCE(?,phone),
              email=COALESCE(?,email), address=COALESCE(?,address) WHERE id = ?`,
-            [name, type, mrc1, mrc2, mrc3, phone, email, address, targetId],
+            [name, sheetType, mrc1, mrc2, mrc3, phone, email, address, targetId],
           );
           updated += 1;
         } else {
           try {
             const res = this.dataSource.execute(
               'INSERT INTO parties (tin, name, type, mrc1, mrc2, mrc3, phone, email, address) VALUES (?,?,?,?,?,?,?,?,?)',
-              [tin, name, type, mrc1, mrc2, mrc3, phone, email, address],
+              [tin, name, sheetType ?? defaultType, mrc1, mrc2, mrc3, phone, email, address],
             );
             const id = Number(res.lastInsertRowid);
             if (tin) byTin.set(tin, id);
@@ -552,7 +560,7 @@ export class ImportExportService {
         });
 
         // 7. Monthly Summary
-        const rMonthly = await this.reportsService.monthlySummary(fy);
+        const rMonthly = await this.reportsService.monthlySummary(fy, user);
         const monthlyCols = [
           { header: 'Month', key: 'month', width: 12 },
           { header: 'Sales', key: 'sales', money: true },
@@ -662,12 +670,12 @@ export class ImportExportService {
     }
   }
 
-  public async buildReportExport(name: string, { fy, month }: any = {}) {
+  public async buildReportExport(name: string, { fy, month }: any = {}, user?: any) {
     const wb = new ExcelJS.Workbook();
     const period = `FY ${fy}${month !== undefined && month !== '' ? ` · ${FY_MONTHS[+month]}` : ''}`;
     switch (name) {
       case 'monthly': {
-        const r = await this.reportsService.monthlySummary(fy);
+        const r = await this.reportsService.monthlySummary(fy, user);
         const cols = [
           { header: 'Month', key: 'month', width: 12 },
           { header: 'Sales', key: 'sales', money: true },
@@ -680,7 +688,7 @@ export class ImportExportService {
         break;
       }
       case 'products': {
-        const rows = await this.reportsService.salesByProduct({ fy, month });
+        const rows = await this.reportsService.salesByProduct({ fy, month }, user);
         const cols = [
           { header: 'Code', key: 'code', width: 12 },
           { header: 'Product', key: 'name', width: 34 },
@@ -694,7 +702,7 @@ export class ImportExportService {
         break;
       }
       case 'suppliers': {
-        const rows = await this.reportsService.partyTotals('P', { fy, month });
+        const rows = await this.reportsService.partyTotals('P', { fy, month }, user);
         const cols = [
           { header: 'Supplier Name', key: 'name', width: 34 },
           { header: 'TIN', key: 'tin', width: 14 },
@@ -711,7 +719,7 @@ export class ImportExportService {
         break;
       }
       case 'customers': {
-        const rows = await this.reportsService.partyTotals('S', { fy, month });
+        const rows = await this.reportsService.partyTotals('S', { fy, month }, user);
         const cols = [
           { header: 'Customer Name', key: 'name', width: 34 },
           { header: 'TIN', key: 'tin', width: 14 },

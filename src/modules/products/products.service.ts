@@ -143,8 +143,8 @@ export class ProductsService {
   public async delete(id: number) {
     const ds = this.productRepo.getDataSource();
     const row = ds.queryOne<{ n: number }>(
-      `SELECT (SELECT COUNT(*) FROM invoice_lines WHERE product_id = :id)
-       + (SELECT COUNT(*) FROM stock_issues WHERE product_id = :id) AS n`,
+      `SELECT (SELECT COUNT(*) FROM invoice_lines WHERE product_id = ?)
+       + (SELECT COUNT(*) FROM stock_issues WHERE product_id = ?) AS n`,
       [id, id],
     );
     const used = row?.n || 0;

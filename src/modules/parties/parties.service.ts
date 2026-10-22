@@ -57,7 +57,8 @@ export class PartiesService {
     if (!p.name) errors.name = 'Name is required';
     if (p.tin && !/^\d{1,15}$/.test(p.tin)) errors.tin = 'TIN must contain digits only';
     if (!['Supplier', 'Customer', 'Both'].includes(p.type)) errors.type = 'Invalid type';
-    if (p.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(p.email)) errors.email = 'Invalid email';
+    // With a profile the e-mail was already checked (and reported) as profile.address.email.
+    if (!profile && p.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(p.email)) errors.email = 'Invalid email';
     if (Object.keys(errors).length) {
       throw new BadRequestException({ message: 'Please correct the highlighted fields', fields: errors });
     }

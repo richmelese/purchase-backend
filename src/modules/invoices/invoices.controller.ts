@@ -3,7 +3,7 @@ import { InvoicesService } from './invoices.service.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { CheckedInHandler } from '../../common/decorators/permission.decorator.js';
 import { DataSource } from '../../orm/data-source.js';
-import { allowedParties, assertCan, assertParty, Right } from '../../common/permissions.js';
+import { allowedParties, assertCan, assertParty, Grant, Right } from '../../common/permissions.js';
 
 // Purchases and sales share every endpoint; only the invoice kind (and so the permission resource) differs.
 // (Express 5 / path-to-regexp v8 no longer supports `:kind(purchases|sales)` route params.)
@@ -19,8 +19,13 @@ abstract class InvoiceKindController {
     return this.kind === 'P' ? 'purchases' : 'sales';
   }
 
-  protected need(user: any, right: Right, ...alternatives: [string, Right][]) {
+  protected need(user: any, right: Right, ...alternatives: Grant[]) {
     assertCan(user, [this.resource, right], ...alternatives);
+  }
+
+  /** Changing an invoice (not recording a payment on it): purchases have a separate task for each. */
+  protected needUpdate(user: any, ...alternatives: Grant[]) {
+    assertCan(user, this.kind === 'P' ? ['purchases', 'edit', 'update_purchase'] : ['sales', 'edit'], ...alternatives);
   }
 
   /** The invoice, if it is of this kind and its company is within the user's access. */
@@ -71,7 +76,7 @@ abstract class InvoiceKindController {
   @CheckedInHandler()
   @Post('report-status')
   async setReportStatus(@Body() body: any, @CurrentUser() user: any) {
-    this.need(user, 'edit');
+    this.needUpdate(user);
     const ids: number[] = Array.isArray(body.ids) ? body.ids.map(Number) : [];
     for (const id of ids) await this.load(user, String(id), 'edit');
     return this.invoicesService.setReportStatus(ids, body.status);
@@ -87,7 +92,7 @@ abstract class InvoiceKindController {
   @CheckedInHandler()
   @Put(':id')
   async updateInvoice(@Param('id') id: string, @Body() body: any, @CurrentUser() user: any) {
-    this.need(user, 'edit');
+    this.needUpdate(user);
     await this.load(user, id, 'edit');
     this.assertBodyParty(user, body, 'edit');
     return this.invoicesService.saveInvoice(this.kind, body, +id, user?.username);
@@ -105,7 +110,7 @@ abstract class InvoiceKindController {
   @CheckedInHandler()
   @Put(':id/withholding')
   async updateWithholding(@Param('id') id: string, @Body() body: any, @CurrentUser() user: any) {
-    this.need(user, 'edit', ['withholding', 'edit']);
+    this.needUpdate(user, ['withholding', 'edit']);
     await this.load(user, id, 'edit');
     return this.invoicesService.updateWithholding(+id, body);
   }
@@ -113,7 +118,8 @@ abstract class InvoiceKindController {
   @CheckedInHandler()
   @Post(':id/payments')
   async addPayment(@Param('id') id: string, @Body() body: any, @CurrentUser() user: any) {
-    this.need(user, 'edit', ['credit', 'create'], ['credit', 'edit']);
+    // Purchases: the role's "Record credit payment" task; sales: the edit right. Credit rights also allow it.
+    assertCan(user, this.kind === 'P' ? ['purchases', 'edit', 'record_payment_p'] : ['sales', 'edit'], ['credit', 'create'], ['credit', 'edit']);
     await this.load(user, id, 'edit');
     return this.invoicesService.addPayment(+id, body);
   }
@@ -152,7 +158,7 @@ export class PaymentsController {
       [+id],
     );
     if (!row) throw new NotFoundException('Not found');
-    assertCan(user, [row.kind === 'P' ? 'purchases' : 'sales', 'edit'], ['credit', 'delete']);
+    assertCan(user, row.kind === 'P' ? ['purchases', 'edit', 'record_payment_p'] : ['sales', 'edit'], ['credit', 'delete']);
     assertParty(user, row.party_id, 'edit');
     return this.invoicesService.deletePayment(+id);
   }

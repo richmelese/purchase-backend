@@ -1,6 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InvoicesService } from '../invoices/invoices.service.js';
 
+/** Aging buckets for open credit invoices, oldest last; `max` is the last day in the bucket. */
+export const AGING_BUCKETS: { label: string; max: number | null }[] = [
+  { label: '0–30', max: 30 },
+  { label: '31–60', max: 60 },
+  { label: '61–90', max: 90 },
+  { label: '90+', max: null },
+];
+
 @Injectable()
 export class CreditService {
   constructor(private readonly invoicesService: InvoicesService) {}
@@ -14,7 +22,7 @@ export class CreditService {
       .filter((i) => !open || i.balance > 0.004)
       .map((i) => {
         const days = Math.floor((today.getTime() - new Date(i.date).getTime()) / 86400000);
-        const bucket = days <= 30 ? '0–30' : days <= 60 ? '31–60' : days <= 90 ? '61–90' : '90+';
+        const bucket = AGING_BUCKETS.find((b) => b.max === null || days <= b.max)!.label;
         return { ...i, age_days: days, age_bucket: bucket };
       });
   }

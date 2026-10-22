@@ -39,11 +39,12 @@ export class SettingsService {
     return {
       ...map,
       current_fy: currentFiscalYear(),
+      // The numbers every calculation uses (the invoice form previews with these too).
+      rules: SettingsService.rulesFrom(map),
     };
   }
 
-  public async getRules(): Promise<typeof DEFAULT_RULES> {
-    const s = await this.getSettings();
+  private static rulesFrom(s: Record<string, any>): typeof DEFAULT_RULES {
     const rules: any = {};
     for (const k of Object.keys(DEFAULT_RULES)) {
       const n = Number(s[k]);
@@ -52,15 +53,20 @@ export class SettingsService {
     return rules;
   }
 
+  public async getRules(): Promise<typeof DEFAULT_RULES> {
+    return (await this.getSettings()).rules;
+  }
+
   public async updateSettings(body: any): Promise<Record<string, any>> {
     const ds = this.settingRepo.getDataSource();
     for (const k of SETTING_KEYS) {
       if (!(k in body)) continue;
       const v = str(body[k]);
       if (k in DEFAULT_RULES) {
+        // A blank rule would read back as 0 (Number('') === 0) and silently switch the tax off.
         const n = Number(v);
-        if (!Number.isFinite(n) || n < 0) {
-          throw new BadRequestException({ message: `Invalid value for ${k}`, fields: { [k]: 'Must be a positive number' } });
+        if (v === '' || !Number.isFinite(n) || n < 0) {
+          throw new BadRequestException({ message: `Invalid value for ${k}`, fields: { [k]: 'Enter a number (0 or more)' } });
         }
       }
       ds.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [k, v]);

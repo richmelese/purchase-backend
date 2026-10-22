@@ -53,16 +53,16 @@ export class RolesService {
   public createRole({ name, label, description, permissions }: any) {
     const rawName = String(name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
     if (!rawName || rawName.length < 2) {
-      throw new BadRequestException('Role code/name is required and must be at least 2 characters');
+      throw new BadRequestException({ message: 'Role code/name is required and must be at least 2 characters', fields: { name: 'At least 2 characters' } });
     }
     const rawLabel = String(label || '').trim();
     if (!rawLabel) {
-      throw new BadRequestException('Role label is required');
+      throw new BadRequestException({ message: 'Role label is required', fields: { label: 'Required' } });
     }
 
     const existing = this.dataSource.queryOne('SELECT id FROM roles WHERE name = ?', [rawName]);
     if (existing) {
-      throw new ConflictException(`A role with code '${rawName}' already exists`);
+      throw new ConflictException({ message: `A role with code '${rawName}' already exists`, fields: { name: 'Already used' } });
     }
 
     const permsJson = JSON.stringify(permissions && typeof permissions === 'object' ? permissions : {});
@@ -79,14 +79,14 @@ export class RolesService {
     const role = this.getRole(id);
 
     const rawLabel = label !== undefined ? String(label).trim() : role.label;
-    if (!rawLabel) throw new BadRequestException('Role label is required');
+    if (!rawLabel) throw new BadRequestException({ message: 'Role label is required', fields: { label: 'Required' } });
 
     let rawName = role.name;
     if (name !== undefined && !role.is_system) {
       rawName = String(name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
-      if (!rawName) throw new BadRequestException('Role code/name is required');
+      if (!rawName) throw new BadRequestException({ message: 'Role code/name is required', fields: { name: 'Required' } });
       const existing = this.dataSource.queryOne('SELECT id FROM roles WHERE name = ? AND id != ?', [rawName, id]);
-      if (existing) throw new ConflictException(`A role with code '${rawName}' already exists`);
+      if (existing) throw new ConflictException({ message: `A role with code '${rawName}' already exists`, fields: { name: 'Already used' } });
     }
 
     let permsJson: string;

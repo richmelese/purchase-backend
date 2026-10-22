@@ -1,5 +1,5 @@
 import { Controller, Get, Param, Query, NotFoundException } from '@nestjs/common';
-import { CreditService } from './credit.service.js';
+import { AGING_BUCKETS, CreditService } from './credit.service.js';
 import { CurrentUser } from '../../common/decorators/current-user.decorator.js';
 import { Permission } from '../../common/decorators/permission.decorator.js';
 
@@ -12,6 +12,13 @@ function kindOf(kind: string): 'P' | 'S' {
 @Controller('credit')
 export class CreditController {
   constructor(private readonly creditService: CreditService) {}
+
+  /** Bucket labels in order, as used in each row's `age_bucket` (declared before :kind). */
+  @Permission(['credit', 'view'])
+  @Get('buckets')
+  getBuckets() {
+    return AGING_BUCKETS;
+  }
 
   @Permission(['credit', 'view'])
   @Get(':kind')

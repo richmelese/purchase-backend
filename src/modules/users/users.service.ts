@@ -3,7 +3,7 @@ import { Repository } from '../../orm/repository.js';
 import { InjectRepository } from '../../orm/decorators/inject-repository.decorator.js';
 import { UserEntity } from '../../entities/user.entity.js';
 import { hashPassword } from '../auth/auth.service.js';
-import { allowedParties, isAdmin, parseCompanyRights, CompanyRights, RIGHTS } from '../../common/permissions.js';
+import { allowedParties, assertCan, isAdmin, parseCompanyRights, CompanyRights, RIGHTS } from '../../common/permissions.js';
 
 /** Company access: all companies, or chosen companies each with its own rights. */
 type Access = { all: boolean; ids: number[]; rights: Record<number, CompanyRights> };
@@ -133,6 +133,10 @@ export class UsersService {
     if (self && (roleChanged || accessChanged || !nextActive)) {
       throw new BadRequestException('You cannot change your own role, company access or status');
     }
+    // The role editor splits the edit right into two tasks; each part of the change needs its own.
+    const accountChanged = fullName !== user.full_name || !!body.password || nextActive !== user.active;
+    if (accountChanged) assertCan(actor, ['users', 'edit', 'update_user']);
+    if (roleChanged || accessChanged) assertCan(actor, ['users', 'edit', 'assign_roles_companies']);
     if (roleChanged || accessChanged) this.assertMayGrant(actor, role, access);
 
     const losesAdmin = targetIsAdmin && user.active && (role.base !== 'admin' || !nextActive);

@@ -152,7 +152,7 @@ export class InvoicesService {
     const period = taxPeriod(h.date);
 
     const ds = this.invoiceRepo.getDataSource();
-    return ds.transaction(async () => {
+    return ds.transactionAsync(async () => {
       const invoice_no = h.invoice_no || (id ? null : this.nextNumber(kind));
       if (invoice_no) {
         const dupNo = ds.queryOne('SELECT id FROM invoices WHERE invoice_no = ? AND id IS NOT ?', [invoice_no, id]);

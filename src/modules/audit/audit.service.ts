@@ -9,6 +9,21 @@ const KIND: Record<string, string> = { purchases: 'purchase', sales: 'sale' };
 const money = (n: any) =>
   Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+/** Areas the activity log records (the `entity` of each entry), for the log's filter. */
+export const AUDIT_ENTITIES: { id: string; label: string }[] = [
+  { id: 'purchase', label: 'Purchases' },
+  { id: 'sale', label: 'Sales' },
+  { id: 'payment', label: 'Payments' },
+  { id: 'withholding', label: 'Withholding' },
+  { id: 'product', label: 'Products' },
+  { id: 'party', label: 'Companies' },
+  { id: 'stock', label: 'Stock' },
+  { id: 'setting', label: 'Settings' },
+  { id: 'vat', label: 'VAT' },
+  { id: 'user', label: 'Users & sign-in' },
+  { id: 'role', label: 'Roles' },
+];
+
 @Injectable()
 export class AuditService {
   private readonly logger = new Logger(AuditService.name);
@@ -70,10 +85,15 @@ export class AuditService {
   }
 
   resolveBeforeLabel(path: string, method: string): string | null {
-    if (method !== 'DELETE') return null;
     const parts = path.replace(/^\/api\//, '').split('/').filter(Boolean);
     const [a, b] = parts;
     if (!b) return null;
+    // A user update logs "role …" only when the role really changes, so remember the current one.
+    if (method === 'PUT' && a === 'users') {
+      const row = this.dataSource.queryOne<{ role_id: number | null }>('SELECT role_id FROM users WHERE id = ?', [+b]);
+      return row ? String(row.role_id ?? '') : null;
+    }
+    if (method !== 'DELETE') return null;
 
     try {
       if (KIND[a]) {
@@ -104,6 +124,10 @@ export class AuditService {
       }
       if (a === 'users') {
         const row = this.dataSource.queryOne<{ l: string }>('SELECT username AS l FROM users WHERE id = ?', [+b]);
+        return row?.l || null;
+      }
+      if (a === 'roles') {
+        const row = this.dataSource.queryOne<{ l: string }>('SELECT label AS l FROM roles WHERE id = ?', [+b]);
         return row?.l || null;
       }
     } catch {
@@ -239,7 +263,7 @@ export class AuditService {
           const u = this.dataSource.queryOne<{ username: string }>('SELECT username FROM users WHERE id = ?', [+b])?.username || b;
           const what = [
             B.active === true ? 'activated' : B.active === false ? 'deactivated' : null,
-            B.role ? `role ${B.role}` : null,
+            B.role_id !== undefined && label !== null && String(B.role_id ?? '') !== label ? `role ${B.role}` : null,
             B.password ? 'password reset' : null,
           ]
             .filter(Boolean)
@@ -247,6 +271,11 @@ export class AuditService {
           return { action: 'update', entity: 'user', entityId: +b, summary: `User “${u}” updated${what ? `: ${what}` : ''}` };
         }
         if (m === 'DELETE') return { action: 'delete', entity: 'user', entityId: +b, summary: `User “${label || b}” deleted` };
+        return null;
+      case 'roles':
+        if (m === 'POST') return { action: 'create', entity: 'role', entityId: body?.id, summary: `Role “${B.label || B.name}” created` };
+        if (m === 'PUT') return { action: 'update', entity: 'role', entityId: +b, summary: `Role “${B.label || label || b}” updated` };
+        if (m === 'DELETE') return { action: 'delete', entity: 'role', entityId: +b, summary: `Role “${label || b}” deleted` };
         return null;
       case 'auth':
         return b === 'password' ? { action: 'update', entity: 'user', summary: 'Changed own password' } : null;

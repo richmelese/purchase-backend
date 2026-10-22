@@ -151,7 +151,8 @@ export class AuthService {
     if (!name) throw new BadRequestException({ message: 'Full name is required', fields: { full_name: 'Required' } });
     this.checkPassword(password);
 
-    return this.userRepo.getDataSource().transaction(async () => {
+    const ds = this.userRepo.getDataSource();
+    return ds.transactionAsync(async () => {
       const usersCount = await this.userRepo.count();
       const first = usersCount === 0;
 
@@ -160,13 +161,17 @@ export class AuthService {
         throw new ConflictException({ message: 'That username is already taken', fields: { username: 'Already taken' } });
       }
 
+      // The first account is the administrator; later sign-ups wait for approval with the viewer role,
+      // so permissions resolve (and the admin can change the role) once they are activated.
+      const role = ds.queryOne<{ id: number }>('SELECT id FROM roles WHERE name = ?', [first ? 'admin' : 'viewer']);
       await this.userRepo.insert({
         username: u,
         full_name: name,
         password_hash: hashPassword(password),
         role: first ? 'admin' : 'user',
+        role_id: role?.id ?? null,
         active: first ? 1 : 0,
-      });
+      } as any);
 
       return { first, pending: !first };
     });
